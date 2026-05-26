@@ -1,0 +1,8 @@
+[Unit]
+Description=system-ai battery sampler
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/system-ai-battery-collect
+Nice=19
+IOSchedulingClass=idle

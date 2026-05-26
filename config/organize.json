@@ -1,0 +1,20 @@
+{
+  "source": "~/Downloads",
+  "min_age_min": 10,
+  "confidence_threshold": 0.9,
+  "unknowns_root": "~/Downloads/unknowns",
+  "auto_apply": true,
+  "categories": {
+    "school":     {"root": "~/Documents/Escuela",  "allow_subdirs": true,  "hint": "material académico chileno: códigos curso (ETVI03/TI3013D/TIE603/FB50/etc), 'Evaluación', 'Sumativa', 'Informe Investigativo', 'Guía'. Sugerir subdir por código de curso si está en el nombre"},
+    "documents":  {"root": "~/Documents",          "allow_subdirs": true,  "hint": "docx, pdf, odt, txt no académicos ni libros. Subdir por tema si claro (Contratos, Recetas, Manuales, etc)"},
+    "images":     {"root": "~/Pictures",           "allow_subdirs": true,  "hint": "jpg/png/webp/gif/heic/raw/svg. Subdir 'screenshots' si nombre tipo Screenshot_*, Captura_*"},
+    "video":      {"root": "~/Videos",             "allow_subdirs": false, "hint": "mp4/mkv/webm/avi/mov"},
+    "music":      {"root": "~/Music",              "allow_subdirs": true,  "hint": "mp3/flac/wav/ogg/mid/m4a/opus. Subdir por artista o género si claro"},
+    "installers": {"root": "~/Software",           "allow_subdirs": true,  "hint": ".deb/.rpm/.AppImage/.iso/.pkg.tar.zst/.exe/.msi/.dmg/.apk. Subdir 'appimages', 'deb', 'iso', 'windows' por tipo"},
+    "ebooks":     {"root": "~/Documents/Libros",   "allow_subdirs": true,  "hint": "pdf libros (no informes), epub, mobi, azw3. Subdir por tema si claro"},
+    "code":       {"root": "~/Projects/inbox",     "allow_subdirs": true,  "hint": "zips/tarballs de repos o código. Subdir = nombre del proyecto extraído del filename"},
+    "archives":   {"root": "~/Documents/Archivos", "allow_subdirs": true,  "hint": "zips/tars sin categoría clara. Subdir por tema si inferible"},
+    "trash":      {"root": "TRASH",                "allow_subdirs": false, "hint": "evidentemente basura: .crdownload, .part, .html sueltos, duplicados (1)(2)(3)"},
+    "keep":       {"root": "KEEP",                 "allow_subdirs": false, "hint": "no se sabe / requiere humano"}
+  }
+}

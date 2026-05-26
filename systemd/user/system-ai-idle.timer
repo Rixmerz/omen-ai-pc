@@ -1,0 +1,10 @@
+[Unit]
+Description=Idle maintenance every 30min
+
+[Timer]
+OnBootSec=10min
+OnUnitActiveSec=30min
+AccuracySec=2min
+
+[Install]
+WantedBy=default.target

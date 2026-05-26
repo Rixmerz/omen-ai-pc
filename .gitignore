@@ -1,0 +1,7 @@
+*.pyc
+__pycache__/
+.venv/
+*.task
+*.bin
+*.onnx
+.DS_Store

@@ -1,0 +1,305 @@
+#!/usr/bin/env python3
+"""
+system-ai-organize — clasifica + mueve archivos de ~/Downloads
+proactivamente via LLM. Diseñado para systemd timer.
+
+Reglas duras (no negociables):
+- Solo toca archivos modificados hace >= min_age_min (evita parciales).
+- Solo source = ~/Downloads (whitelist).
+- Skip dotfiles, .crdownload, .part.
+- Categoría 'trash' → gio trash (recuperable).
+- Categoría 'keep' → no mueve.
+- Si confidence < threshold → log + skip.
+- Conflicto de nombre destino → sufijo .1 .2 etc.
+- Log JSONL de TODO movimiento → ~/.local/state/system-ai-organize.log.
+"""
+from __future__ import annotations
+import argparse
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+CONFIG_PATH = Path.home() / ".config/system-ai/organize.json"
+LOG = Path.home() / ".local/state/system-ai-organize.log"
+LOG.parent.mkdir(parents=True, exist_ok=True)
+
+OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+MODEL = "qwen2.5-coder:7b-instruct-q4_K_M"
+
+SKIP_SUFFIXES = (".crdownload", ".part", ".tmp", ".download")
+
+
+def expand(p: str) -> Path:
+    return Path(os.path.expanduser(p)).resolve()
+
+
+def load_cfg() -> dict:
+    with CONFIG_PATH.open() as f:
+        return json.load(f)
+
+
+def alog(d: dict) -> None:
+    d["ts"] = int(time.time())
+    with LOG.open("a") as f:
+        f.write(json.dumps(d, ensure_ascii=False) + "\n")
+
+
+def mime_of(p: Path) -> str:
+    try:
+        return subprocess.check_output(["file", "-b", "--mime-type", str(p)], text=True, timeout=4).strip()
+    except Exception:
+        return ""
+
+
+def candidates(src: Path, min_age_min: int) -> list[Path]:
+    cutoff = time.time() - min_age_min * 60
+    out = []
+    for p in src.iterdir():
+        if p.name.startswith("."):
+            continue
+        if p.is_dir():
+            continue
+        if any(p.name.endswith(sfx) for sfx in SKIP_SUFFIXES):
+            continue
+        try:
+            if p.stat().st_mtime > cutoff:
+                continue
+        except FileNotFoundError:
+            continue
+        out.append(p)
+    return out
+
+
+def build_prompt(cfg: dict) -> str:
+    lines = []
+    for k, v in cfg["categories"].items():
+        sub = " (puede sugerir subdir)" if v.get("allow_subdirs") else " (sin subdir)"
+        lines.append(f"- {k}{sub}: {v['hint']}")
+    cats = "\n".join(lines)
+    return f"""Clasificás archivos descargados en sistema Arch Linux personal. Recibís lista JSON. Devuelves objeto con categoría + subdir opcional + confianza + razón breve.
+
+Output JSON ESTRICTO:
+{{"items": [{{"name": "<filename exacto>", "category": "<key>", "subdir": "<nombre subcarpeta o cadena vacía>", "confidence": <float 0-1>, "reason": "<frase corta ES>"}}, ...]}}
+
+Categorías válidas (usar key exacto):
+{cats}
+
+Reglas subdir:
+- Solo si categoría permite subdir Y tenés señal clara en el nombre.
+- Subdir simple: alfanuméricos, guiones bajos, sin '/', sin '..', sin path absoluto. Máx 40 chars.
+- Ejemplos: 'TI3013D', 'TIE603', 'screenshots', 'appimages', 'recetas'.
+- Si no aplica o duda → subdir vacío "".
+
+Reglas categoría (orden de prioridad):
+1. **REGLA SCHOOL (prioritaria sobre todas):** si filename contiene CUALQUIERA de estos patrones → category="school" SIEMPRE, sin importar la extensión:
+   - Códigos curso: ETVI##, TI####, TIE###, FB##, AOL, EII, SET, FB50, N1, N3, P1#, C1V, C2V
+   - Palabras: 'Evaluación', 'Evaluacion', 'Sumativa', 'Informe Investigativo', 'Guía Sumativa', 'Desafío', 'Integrador'
+   - Patrón fecha-curso tipo "2026O <código>"
+   Subdir = primer código curso encontrado en el nombre (ej "TI3013D", "TIE603", "ETVI03").
+   IMPORTANTE: aunque sea .zip, .pdf, .docx → school, NUNCA installers/archives/code para estos.
+2. Solo si NO es school: .deb→installers/deb, .AppImage→installers/appimages, .iso→installers/iso, .exe/.msi→installers/windows.
+3. Solo si NO es school: zips de código (repos, githubs descargados) → code, subdir=nombre proyecto.
+4. Duplicados (1)(2)(3) → trash 0.85 SOLO si nombre genérico; si es académico → school (los duplicados de tarea son válidos).
+5. Duda → "keep" confidence 0.5.
+6. Confidence alta (>0.85) solo si patrón claro.
+7. SOLO JSON. Sin saludos, sin texto extra, sin markdown."""
+
+
+def classify(cfg: dict, files: list[Path]) -> dict:
+    payload = [{"name": p.name, "size_mb": round(p.stat().st_size / 1024 / 1024, 1), "ext": p.suffix.lower(), "mime": mime_of(p)} for p in files]
+    body = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": build_prompt(cfg)},
+            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
+        ],
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.1, "num_ctx": 8192},
+    }
+    req = urllib.request.Request(OLLAMA_URL, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=240) as r:
+        content = json.loads(r.read()).get("message", {}).get("content", "{}")
+    try:
+        return json.loads(content)
+    except Exception:
+        return {"items": []}
+
+
+def unique_dest(target_dir: Path, name: str) -> Path:
+    p = target_dir / name
+    if not p.exists():
+        return p
+    stem, ext = os.path.splitext(name)
+    i = 1
+    while True:
+        cand = target_dir / f"{stem}.{i}{ext}"
+        if not cand.exists():
+            return cand
+        i += 1
+
+
+def move_to_trash(p: Path) -> tuple[bool, str]:
+    if shutil.which("gio"):
+        r = subprocess.run(["gio", "trash", str(p)], capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            return True, "gio trash"
+        return False, r.stderr.strip()
+    # fallback: ~/.local/share/Trash/files
+    trash = Path.home() / ".local/share/Trash/files"
+    trash.mkdir(parents=True, exist_ok=True)
+    try:
+        shutil.move(str(p), str(unique_dest(trash, p.name)))
+        return True, "manual trash"
+    except Exception as e:
+        return False, str(e)
+
+
+SUBDIR_RE = re.compile(r"^[A-Za-z0-9_\-]{1,40}$")
+
+
+def sanitize_subdir(s: str) -> str:
+    s = (s or "").strip().strip("/")
+    if not s:
+        return ""
+    # Tomar solo primer componente, validar
+    first = s.split("/")[0]
+    if SUBDIR_RE.match(first):
+        return first
+    return ""
+
+
+def apply_move(p: Path, category: str, subdir: str, cfg: dict, dry: bool) -> dict:
+    catdef = cfg["categories"].get(category)
+    if not catdef:
+        return {"action": "skip", "reason": f"category unknown: {category}"}
+    root = catdef["root"]
+    if root == "KEEP":
+        return {"action": "keep", "reason": "category=keep"}
+    if root == "TRASH":
+        if dry:
+            return {"action": "dry-trash", "reason": "would gio trash"}
+        ok, msg = move_to_trash(p)
+        return {"action": "trash" if ok else "trash-fail", "msg": msg}
+    root_dir = expand(root)
+    target_dir = root_dir
+    if catdef.get("allow_subdirs") and subdir:
+        clean = sanitize_subdir(subdir)
+        if clean:
+            cand = (root_dir / clean).resolve()
+            # Doble check: debe estar dentro de root_dir
+            if str(cand).startswith(str(root_dir) + os.sep) or cand == root_dir:
+                target_dir = cand
+            else:
+                return {"action": "skip", "reason": f"subdir escape: {subdir}"}
+    target_dir.mkdir(parents=True, exist_ok=True)
+    dest = unique_dest(target_dir, p.name)
+    if dry:
+        return {"action": "dry-move", "to": str(dest)}
+    try:
+        shutil.move(str(p), str(dest))
+        return {"action": "moved", "to": str(dest)}
+    except Exception as e:
+        return {"action": "move-fail", "msg": str(e)}
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--dry-run", action="store_true", help="solo proponer, no mover")
+    ap.add_argument("--apply", action="store_true", help="forzar move (override config auto_apply)")
+    ap.add_argument("--threshold", type=float, help="override confidence threshold")
+    args = ap.parse_args()
+
+    cfg = load_cfg()
+    src = expand(cfg["source"])
+    if not src.is_dir():
+        print(f"source no existe: {src}", file=sys.stderr)
+        return 2
+    thr = args.threshold if args.threshold is not None else cfg.get("confidence_threshold", 0.7)
+    dry = args.dry_run or (not args.apply and not cfg.get("auto_apply", False))
+
+    files = candidates(src, cfg.get("min_age_min", 10))
+    if not files:
+        print("nada que clasificar")
+        return 0
+
+    # batch en grupos de 30 para no explotar contexto
+    BATCH = 30
+    all_items = []
+    for i in range(0, len(files), BATCH):
+        batch = files[i:i+BATCH]
+        try:
+            resp = classify(cfg, batch)
+        except Exception as e:
+            print(f"classify err: {e}", file=sys.stderr)
+            alog({"event": "classify_error", "msg": str(e)})
+            continue
+        all_items.extend(resp.get("items", []))
+
+    by_name = {p.name: p for p in files}
+    moved = 0
+    trashed = 0
+    skipped = 0
+    summary = {"moved": [], "trashed": [], "skipped": [], "kept": []}
+
+    unknowns_root = expand(cfg.get("unknowns_root", "~/Downloads/unknowns"))
+
+    def move_to_unknowns(p: Path) -> dict:
+        ext = p.suffix.lower().lstrip(".") or "no-ext"
+        ext = re.sub(r"[^a-z0-9]", "", ext)[:10] or "no-ext"
+        target = unknowns_root / ext
+        target.mkdir(parents=True, exist_ok=True)
+        dest = unique_dest(target, p.name)
+        if dry:
+            return {"action": "dry-unknown", "to": str(dest)}
+        try:
+            shutil.move(str(p), str(dest))
+            return {"action": "unknown", "to": str(dest)}
+        except Exception as e:
+            return {"action": "unknown-fail", "msg": str(e)}
+
+    for it in all_items:
+        name = it.get("name")
+        cat = it.get("category", "keep")
+        subdir = it.get("subdir", "") or ""
+        conf = float(it.get("confidence", 0))
+        reason = it.get("reason", "")
+        p = by_name.get(name)
+        if not p or not p.exists():
+            continue
+        if conf < thr or cat == "keep":
+            # Route a unknowns/<ext>/
+            result = move_to_unknowns(p)
+            entry = {"event": "low_conf_route", "name": name, "category": cat, "subdir": subdir, "confidence": conf, "reason": reason, "dry": dry, **result}
+            alog(entry)
+            summary["kept"].append({"name": name, "to": result.get("to"), "reason": f"conf {conf:.2f}"})
+            skipped += 1
+            continue
+        result = apply_move(p, cat, subdir, cfg, dry)
+        entry = {"event": "classify", "name": name, "category": cat, "subdir": subdir, "confidence": conf, "reason": reason, "dry": dry, **result}
+        alog(entry)
+        if result["action"] in ("moved", "dry-move"):
+            summary["moved"].append({"name": name, "to": result.get("to"), "cat": cat})
+            moved += 1
+        elif result["action"] in ("trash", "dry-trash"):
+            summary["trashed"].append({"name": name})
+            trashed += 1
+        else:
+            summary["kept"].append({"name": name, "reason": result.get("reason", "")})
+            skipped += 1
+
+    msg = f"[{'DRY' if dry else 'APPLY'}] moved={moved} trashed={trashed} unknowns={skipped}"
+    print(msg)
+    if not dry and (moved or trashed):
+        subprocess.run(["notify-send", "-a", "system-ai-organize", "Downloads organizados", msg], check=False)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

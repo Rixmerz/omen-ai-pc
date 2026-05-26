@@ -1,0 +1,188 @@
+#!/usr/bin/env python3
+"""
+system-ai-approve — revisa sugerencia pendiente del observer y ejecuta
+una tool whitelist tras confirmación y/N.
+"""
+from __future__ import annotations
+import json
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+PENDING = Path.home() / ".local/state/system-ai-pending.json"
+ACTION_LOG = Path.home() / ".local/state/system-ai-actions.log"
+ACTION_LOG.parent.mkdir(parents=True, exist_ok=True)
+
+# Procesos jamás-kill (substring lowercase)
+CRITICAL = (
+    "hyprland", "systemd", "dbus", "pipewire", "wireplumber",
+    "wayland", "xorg", "xwayland", "init", "kthreadd",
+    "agetty", "login", "sudo", "polkit", "udev", "pulseaudio",
+)
+
+
+def alog(d: dict) -> None:
+    d["ts"] = int(time.time())
+    with ACTION_LOG.open("a") as f:
+        f.write(json.dumps(d, ensure_ascii=False) + "\n")
+
+
+def is_critical_proc(name_or_cmd: str) -> bool:
+    s = name_or_cmd.lower()
+    return any(c in s for c in CRITICAL)
+
+
+def get_proc_name(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except Exception:
+        return ""
+
+
+def tool_kill_pid(args: dict) -> tuple[bool, str]:
+    pid = args.get("pid")
+    if not isinstance(pid, int) or pid <= 1:
+        return False, f"pid inválido: {pid}"
+    name = get_proc_name(pid)
+    if not name:
+        return False, f"pid {pid} no existe"
+    if is_critical_proc(name):
+        return False, f"REFUSED: {name} (pid {pid}) es proceso crítico"
+    try:
+        os.kill(pid, signal.SIGTERM)
+        return True, f"SIGTERM enviado a {name} (pid {pid})"
+    except Exception as e:
+        return False, f"kill falló: {e}"
+
+
+def tool_kill_pattern(args: dict) -> tuple[bool, str]:
+    pat = args.get("pattern", "")
+    if not isinstance(pat, str) or len(pat) < 3 or not re.match(r"^[\w\-./]+$", pat):
+        return False, f"pattern inválido o muy corto: {pat!r}"
+    if is_critical_proc(pat):
+        return False, f"REFUSED: pattern {pat!r} matchea crítico"
+    pgrep = subprocess.run(["pgrep", "-f", pat], capture_output=True, text=True)
+    pids = [int(p) for p in pgrep.stdout.split() if p.isdigit()]
+    safe_pids = [p for p in pids if not is_critical_proc(get_proc_name(p))]
+    if not safe_pids:
+        return False, f"sin matches seguros para {pat!r}"
+    killed = []
+    for p in safe_pids:
+        try:
+            os.kill(p, signal.SIGTERM)
+            killed.append(p)
+        except Exception:
+            pass
+    return True, f"SIGTERM a {len(killed)} procesos: {killed}"
+
+
+def tool_drop_caches(args: dict) -> tuple[bool, str]:
+    try:
+        subprocess.run(["sync"], check=True, timeout=10)
+    except Exception as e:
+        return False, f"sync falló: {e}"
+    r = subprocess.run(
+        ["sudo", "-n", "tee", "/proc/sys/vm/drop_caches"],
+        input="3\n", capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        return True, "page cache liberado (3)"
+    return False, f"drop_caches falló (sudo NOPASSWD requerido): {r.stderr.strip()}"
+
+
+def tool_cpu_limit_w(args: dict) -> tuple[bool, str]:
+    w = args.get("watts")
+    if not isinstance(w, int) or not (15 <= w <= 30):
+        return False, f"watts fuera de rango [15-30]: {w}"
+    ryz = shutil.which("ryzenadj")
+    if not ryz:
+        return False, "ryzenadj no encontrado"
+    mw = w * 1000
+    r = subprocess.run(
+        ["sudo", "-n", ryz, f"--stapm-limit={mw}", f"--fast-limit={mw}", f"--slow-limit={mw}"],
+        capture_output=True, text=True,
+    )
+    if r.returncode == 0:
+        return True, f"ryzenadj {w}W aplicado"
+    return False, f"ryzenadj falló (sudo NOPASSWD requerido): {r.stderr.strip()}"
+
+
+def tool_none(args: dict) -> tuple[bool, str]:
+    return True, "noop (solo notif)"
+
+
+def tool_set_profile(args: dict) -> tuple[bool, str]:
+    nm = args.get("name")
+    if nm not in ("perf", "balanced", "quiet"):
+        return False, f"profile inválido: {nm}"
+    prof = shutil.which("system-ai-profile") or str(Path.home() / ".local/bin/system-ai-profile")
+    r = subprocess.run([prof, nm], capture_output=True, text=True, timeout=15)
+    if r.returncode == 0:
+        return True, f"profile → {nm}"
+    return False, f"falla: {r.stderr.strip() or r.stdout.strip()}"
+
+
+TOOLS = {
+    "kill_pid": tool_kill_pid,
+    "kill_pattern": tool_kill_pattern,
+    "drop_caches": tool_drop_caches,
+    "cpu_limit_w": tool_cpu_limit_w,
+    "set_profile": tool_set_profile,
+    "none": tool_none,
+}
+
+
+def main() -> int:
+    if not PENDING.exists():
+        print("Sin sugerencias pendientes.")
+        return 0
+    try:
+        pend = json.loads(PENDING.read_text())
+    except Exception as e:
+        print(f"pending corrupto: {e}")
+        return 1
+
+    v = pend.get("verdict", {})
+    print("─" * 60)
+    print(f"Pendiente desde: {time.ctime(pend.get('ts', 0))}")
+    print(f"Métrica:    {v.get('metric')}")
+    print(f"Valor:      {v.get('value')}")
+    print(f"Causa:      {v.get('cause')}")
+    print(f"Resumen:    {v.get('summary')}")
+    exec_ = v.get("exec", {}) or {}
+    tool = exec_.get("tool", "none")
+    args = exec_.get("args", {}) or {}
+    print(f"Tool:       {tool}")
+    print(f"Args:       {args}")
+    print("─" * 60)
+
+    if tool not in TOOLS:
+        print(f"Tool no reconocida: {tool}. Aborto.")
+        alog({"action": "rejected", "reason": "unknown_tool", "verdict": v})
+        return 1
+
+    ans = input(f"Ejecutar {tool}? [y/N] ").strip().lower()
+    if ans != "y":
+        print("Cancelado.")
+        alog({"action": "cancelled", "verdict": v})
+        return 0
+
+    ok, msg = TOOLS[tool](args)
+    print(("OK" if ok else "FAIL") + f": {msg}")
+    alog({"action": "executed", "ok": ok, "msg": msg, "verdict": v})
+    if ok:
+        PENDING.unlink(missing_ok=True)
+    return 0 if ok else 1
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main())
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)

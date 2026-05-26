@@ -1,0 +1,9 @@
+[Unit]
+Description=system-ai idle maintenance tasks
+After=ollama.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/system-ai-idle-tasks
+Nice=19
+IOSchedulingClass=idle

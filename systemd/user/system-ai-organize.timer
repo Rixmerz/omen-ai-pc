@@ -1,0 +1,10 @@
+[Unit]
+Description=Run downloads organizer every 15min
+
+[Timer]
+OnBootSec=5min
+OnUnitActiveSec=15min
+AccuracySec=1min
+
+[Install]
+WantedBy=default.target

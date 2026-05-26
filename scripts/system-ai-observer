@@ -1,0 +1,362 @@
+#!/usr/bin/env python3
+"""
+system-ai-observer — Fase 1 (read-only).
+Recolecta métricas, consulta LLM local, notifica si hay anomalía.
+"""
+from __future__ import annotations
+import json
+import os
+import subprocess
+import sys
+import time
+import urllib.request
+import urllib.error
+from pathlib import Path
+
+OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+MODEL = "qwen2.5-coder:7b-instruct-q4_K_M"
+LOG_PATH = Path.home() / ".local/state/system-ai.log"
+LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+
+SYSTEM_PROMPT = """Analista de sistema Arch Linux/Hyprland — HP OMEN (Ryzen 7 4800H, RTX 2060 Mobile 6GB, 16GB RAM). Recibís snapshot JSON. Output JSON ESTRICTO, sin code fences, sin texto extra.
+
+FORMATO OUTPUT (SOLO JSON, nada más):
+- Nominal: {"anomaly": false}
+- Anomalía: {"anomaly": true, "metric": "<n>", "value": <v>, "cause": "<proc o sistema>", "summary": "<frase ES>", "exec": {"tool": "<t>", "args": {...}}}
+
+TOOLS:
+- "none" — solo notificar
+- "kill_pid" {"pid": <int>} — SIEMPRE preferir esto sobre kill_pattern cuando hay PID en top_procs
+- "kill_pattern" {"pattern": "<alfanum/guión/punto/slash únicamente>"} — un solo proc name simple, NUNCA pipes ni regex ni listas
+- "drop_caches" {} — RAM presionada por cache
+- "cpu_limit_w" {"watts": <15-30>} — sobrecalentamiento CPU
+- "set_profile" {"name": "<perf|balanced|quiet>"} — perfil energético coherente. Considerar workload_hint del snapshot: game→perf, code/browse→balanced, idle/media on battery→quiet. NO repetir si current_profile ya coincide.
+
+REGLAS DURAS:
+1. Default {"anomaly": false}. Si dudás, NO reportes.
+2. Si RAM/swap alto: identificá EL UN proceso con mayor rss_mb que NO esté en WHITELIST. Usá su comm y EXIGE kill_pid con su PID si está en top_procs (asumir top_procs incluye pid si presente). Si todos los top procs están en whitelist → exec.tool="none".
+3. WHITELIST procs (NUNCA matar, ni por pid ni por pattern): claude, node, ollama, hyprland, eww, waybar, pipewire, wireplumber, xwayland, Xorg, code, firefox, chromium, electron, dbus, systemd, sudo, polkit, NetworkManager, ssh, sshd, bash, fish, zsh.
+4. Solo JSON. Sin explicaciones. Sin disclaimers.
+
+UMBRALES (anomalía solo si excede):
+- ram_pct > 85
+- swap_pct > 60
+- cpu_temp_c > 88 sostenido
+- gpu.temp_c > 82
+- igpu_temp_c > 90
+- nvme_temp_c > 75
+- battery.draw_w > 45 (solo si ac_online=false)
+- battery.capacity_pct < 10 (solo si ac_online=false)
+- recent_errors length > 8
+
+EJEMPLOS:
+
+Input nominal:
+{"ram_pct":40,"cpu_temp_c":55,"top_procs":[{"comm":"firefox","rss_mb":1200}]}
+Output: {"anomaly":false}
+
+Input anomaly con proc fuera whitelist:
+{"ram_pct":91,"top_procs":[{"comm":"rogue-leak","rss_mb":6800,"pid":12345},{"comm":"firefox","rss_mb":1200,"pid":2000}]}
+Output: {"anomaly":true,"metric":"ram_pct","value":91,"cause":"rogue-leak rss 6.8GB","summary":"RAM 91% — proceso rogue-leak consume 6.8GB","exec":{"tool":"kill_pid","args":{"pid":12345}}}
+
+Input anomaly todos whitelist:
+{"ram_pct":88,"top_procs":[{"comm":"firefox","rss_mb":4500},{"comm":"chromium","rss_mb":3800}]}
+Output: {"anomaly":true,"metric":"ram_pct","value":88,"cause":"navegadores RAM alta","summary":"RAM 88% — navegadores dominan, cerrar pestañas manualmente","exec":{"tool":"none","args":{}}}
+
+Input CPU temp alto:
+{"cpu_temp_c":92,"top_procs":[{"comm":"compilador","rss_mb":800}]}
+Output: {"anomaly":true,"metric":"cpu_temp_c","value":92,"cause":"carga CPU sostenida","summary":"CPU 92°C — throttle preventivo","exec":{"tool":"cpu_limit_w","args":{"watts":20}}}"""
+
+
+def run(cmd: list[str], timeout: int = 5) -> str:
+    try:
+        return subprocess.check_output(cmd, timeout=timeout, text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return ""
+
+
+def collect() -> dict:
+    snap: dict = {"ts": int(time.time())}
+
+    # memoria
+    meminfo = {}
+    try:
+        for line in Path("/proc/meminfo").read_text().splitlines():
+            k, _, v = line.partition(":")
+            meminfo[k.strip()] = int(v.strip().split()[0])
+    except Exception:
+        pass
+    total = meminfo.get("MemTotal", 1)
+    avail = meminfo.get("MemAvailable", 0)
+    swap_t = meminfo.get("SwapTotal", 1)
+    swap_f = meminfo.get("SwapFree", 0)
+    snap["ram_pct"] = round((1 - avail / total) * 100, 1)
+    snap["ram_gb"] = round(total / 1024 / 1024, 1)
+    snap["swap_pct"] = round((1 - swap_f / swap_t) * 100, 1) if swap_t else 0
+
+    # load
+    try:
+        snap["load"] = Path("/proc/loadavg").read_text().split()[:3]
+    except Exception:
+        snap["load"] = []
+
+    # top RSS procs
+    ps = run(["ps", "-eo", "pid,rss,comm", "--sort=-rss", "--no-headers"])
+    top = []
+    for line in ps.splitlines()[:8]:
+        parts = line.strip().split(None, 2)
+        if len(parts) == 3:
+            pid_ = int(parts[0])
+            rss_mb = int(parts[1]) // 1024
+            if rss_mb > 100:
+                top.append({"pid": pid_, "comm": parts[2][:24], "rss_mb": rss_mb})
+    snap["top_procs"] = top
+
+    # temps via sensors -j (lm_sensors)
+    sj = run(["sensors", "-j"])
+    if sj:
+        try:
+            s = json.loads(sj)
+            k10 = s.get("k10temp-pci-00c3", {}).get("Tctl", {}).get("temp1_input")
+            if k10 is not None:
+                snap["cpu_temp_c"] = round(k10, 1)
+            ig = s.get("amdgpu-pci-0600", {}).get("edge", {}).get("temp1_input")
+            if ig is not None:
+                snap["igpu_temp_c"] = round(ig, 1)
+            nv = s.get("nvme-pci-0500", {}).get("Composite", {}).get("temp1_input")
+            if nv is not None:
+                snap["nvme_temp_c"] = round(nv, 1)
+        except Exception:
+            pass
+
+    # NVIDIA
+    nv = run(["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"])
+    if nv.strip():
+        try:
+            t, util, mu, mt = [int(x.strip()) for x in nv.strip().split(",")]
+            snap["gpu"] = {"temp_c": t, "util_pct": util, "vram_used_mb": mu, "vram_total_mb": mt}
+        except Exception:
+            pass
+
+    # batería
+    for bat in Path("/sys/class/power_supply").glob("BAT*"):
+        try:
+            status = (bat / "status").read_text().strip()
+            cap = int((bat / "capacity").read_text())
+            erate = 0
+            if (bat / "power_now").exists():
+                erate = int((bat / "power_now").read_text()) / 1_000_000
+            snap["battery"] = {"status": status, "capacity_pct": cap, "draw_w": round(erate, 1)}
+        except Exception:
+            pass
+
+    # AC
+    for ac in Path("/sys/class/power_supply").glob("A*"):
+        online = ac / "online"
+        if online.exists():
+            snap["ac_online"] = online.read_text().strip() == "1"
+            break
+
+    # journal errors last 5min
+    j = run(["journalctl", "-p", "err", "--since", "5min ago", "--no-pager", "-q", "-o", "cat"], timeout=10)
+    errs = [l for l in j.splitlines() if l.strip()][:10]
+    snap["recent_errors"] = errs
+
+    # workload hint vía Hyprland active window class
+    aw = run(["hyprctl", "activewindow", "-j"])
+    workload = "default"
+    if aw:
+        try:
+            cls = (json.loads(aw).get("class") or "").lower()
+            if any(k in cls for k in ("steam", "gamescope", "lutris", "wine", "heroic", "minecraft")):
+                workload = "game"
+            elif any(k in cls for k in ("code", "codium", "neovim", "jetbrains", "pycharm", "intellij", "ghostty", "kitty", "alacritty", "terminal", "wezterm")):
+                workload = "code"
+            elif any(k in cls for k in ("firefox", "chromium", "brave", "librewolf", "vivaldi")):
+                workload = "browse"
+            elif any(k in cls for k in ("mpv", "vlc", "kdenlive", "obs", "blender", "darktable", "gimp")):
+                workload = "media"
+        except Exception:
+            pass
+    snap["workload_hint"] = workload
+
+    # perfil actual
+    pstate = Path.home() / ".local/state/system-ai-profile.json"
+    if pstate.exists():
+        try:
+            snap["current_profile"] = json.loads(pstate.read_text()).get("current")
+        except Exception:
+            pass
+
+    return snap
+
+
+def ask_llm(snap: dict) -> dict:
+    body = {
+        "model": MODEL,
+        "messages": [
+            {"role": "system", "content": SYSTEM_PROMPT},
+            {"role": "user", "content": "Snapshot:\n" + json.dumps(snap, ensure_ascii=False)},
+        ],
+        "stream": False,
+        "format": "json",
+        "options": {"temperature": 0.1, "num_ctx": 4096},
+    }
+    req = urllib.request.Request(
+        OLLAMA_URL,
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"},
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as r:
+            data = json.loads(r.read())
+        content = data.get("message", {}).get("content", "").strip()
+        return json.loads(content)
+    except Exception as e:
+        return {"anomaly": False, "error": str(e)}
+
+
+def notify(title: str, body: str) -> None:
+    subprocess.run(
+        ["notify-send", "-a", "system-ai", "-u", "normal", "-i", "dialog-information", title, body],
+        check=False,
+    )
+
+
+PENDING_PATH = Path.home() / ".local/state/system-ai-pending.json"
+ACTIONS_LOG = Path.home() / ".local/state/system-ai-actions.log"
+
+# WHITELIST procs (jamás target, ni por pid ni pattern). Substring lowercase.
+WHITELIST = (
+    "claude", "node", "ollama", "hyprland", "eww", "waybar",
+    "pipewire", "wireplumber", "xwayland", "xorg", "code", "firefox",
+    "chromium", "electron", "dbus", "systemd", "sudo", "polkit",
+    "networkmanager", "ssh", "bash", "fish", "zsh", "init", "kthreadd",
+    "udev", "agetty", "login",
+)
+AUTO_TOOLS = {"drop_caches", "set_profile"}  # Fase 3 — ejecutadas sin y/N
+
+
+def is_whitelisted(name: str) -> bool:
+    s = (name or "").lower()
+    return any(w in s for w in WHITELIST)
+
+
+def get_proc_name(pid: int) -> str:
+    try:
+        return Path(f"/proc/{pid}/comm").read_text().strip()
+    except Exception:
+        return ""
+
+
+def validate_verdict(v: dict) -> dict:
+    """Sanitiza propuesta del LLM. Degrada a 'none' si target invalido o whitelisted."""
+    if not v.get("anomaly"):
+        return v
+    exec_ = v.get("exec") or {}
+    tool = exec_.get("tool", "none")
+    args = exec_.get("args") or {}
+
+    def degrade(reason: str) -> None:
+        v["exec"] = {"tool": "none", "args": {}}
+        v["downgraded_from"] = {"tool": tool, "args": args, "reason": reason}
+
+    if tool == "kill_pid":
+        pid = args.get("pid")
+        if not isinstance(pid, int) or pid <= 1:
+            degrade(f"pid inválido: {pid}")
+        else:
+            name = get_proc_name(pid)
+            if not name:
+                degrade(f"pid {pid} ya no existe")
+            elif is_whitelisted(name):
+                degrade(f"target {name} en whitelist")
+    elif tool == "kill_pattern":
+        pat = args.get("pattern", "")
+        import re as _re
+        if not isinstance(pat, str) or len(pat) < 3 or not _re.match(r"^[\w\-./]+$", pat):
+            degrade(f"pattern inválido: {pat!r}")
+        elif is_whitelisted(pat):
+            degrade(f"pattern matchea whitelist: {pat!r}")
+    elif tool == "cpu_limit_w":
+        w = args.get("watts")
+        if not isinstance(w, int) or not (15 <= w <= 30):
+            degrade(f"watts fuera rango: {w}")
+    elif tool == "drop_caches":
+        pass
+    elif tool == "set_profile":
+        nm = args.get("name")
+        if nm not in ("perf", "balanced", "quiet"):
+            degrade(f"profile inválido: {nm}")
+    elif tool == "none":
+        pass
+    else:
+        degrade(f"tool desconocida: {tool}")
+    return v
+
+
+def auto_exec(tool: str, args: dict) -> tuple[bool, str]:
+    if tool == "drop_caches":
+        try:
+            subprocess.run(["sync"], check=True, timeout=10)
+        except Exception as e:
+            return False, f"sync fail: {e}"
+        r = subprocess.run(
+            ["sudo", "-n", "tee", "/proc/sys/vm/drop_caches"],
+            input="3\n", capture_output=True, text=True,
+        )
+        if r.returncode == 0:
+            return True, "page cache liberado"
+        return False, f"drop_caches fail (sudo NOPASSWD?): {r.stderr.strip()}"
+    if tool == "set_profile":
+        nm = args.get("name", "balanced")
+        prof = Path.home() / ".local/bin/system-ai-profile"
+        r = subprocess.run([str(prof), nm], capture_output=True, text=True, timeout=15)
+        if r.returncode == 0:
+            return True, f"profile → {nm}"
+        return False, f"set_profile fail: {r.stderr.strip() or r.stdout.strip()}"
+    return False, f"auto_exec sin handler para {tool}"
+
+
+def alog(d: dict) -> None:
+    d["ts"] = int(time.time())
+    with ACTIONS_LOG.open("a") as f:
+        f.write(json.dumps(d, ensure_ascii=False) + "\n")
+
+
+def log(snap: dict, verdict: dict) -> None:
+    with LOG_PATH.open("a") as f:
+        f.write(json.dumps({"ts": snap["ts"], "verdict": verdict, "snap": snap}, ensure_ascii=False) + "\n")
+
+
+def main() -> int:
+    snap = collect()
+    verdict = ask_llm(snap)
+    verdict = validate_verdict(verdict)
+    log(snap, verdict)
+
+    if not verdict.get("anomaly"):
+        print(json.dumps(verdict, ensure_ascii=False))
+        return 0
+
+    summary = verdict.get("summary") or verdict.get("cause") or "anomaly"
+    exec_ = verdict.get("exec") or {}
+    tool = exec_.get("tool", "none")
+    args = exec_.get("args") or {}
+
+    if tool in AUTO_TOOLS:
+        ok, msg = auto_exec(tool, args)
+        alog({"action": "auto", "tool": tool, "args": args, "ok": ok, "msg": msg, "verdict": verdict})
+        notify("system-ai (auto)", f"{summary}\nAUTO {tool}: {msg}"[:300])
+    elif tool == "none":
+        notify("system-ai", summary[:300])
+    else:
+        PENDING_PATH.write_text(json.dumps({"ts": snap["ts"], "verdict": verdict}, ensure_ascii=False))
+        notify("system-ai", f"{summary}\nrun: system-ai-approve  ({tool})"[:300])
+
+    print(json.dumps(verdict, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,113 @@
+#!/usr/bin/env python3
+"""
+system-ai-profile — fija perfil de energía coherente.
+Uso: system-ai-profile <perf|balanced|quiet|status>
+
+Conjunta:
+- ryzenadj (CPU power limit)
+- nvidia-smi power limit (si aplica)
+- cpufreq governor
+
+Requiere sudoers NOPASSWD para ryzenadj/nvidia-smi/cpupower (ver /etc/sudoers.d/system-ai).
+"""
+from __future__ import annotations
+import json
+import shutil
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+STATE = Path.home() / ".local/state/system-ai-profile.json"
+STATE.parent.mkdir(parents=True, exist_ok=True)
+
+PROFILES = {
+    "perf":     {"ryzenadj_w": 30, "nvidia_pl": 80, "governor": "performance"},
+    "balanced": {"ryzenadj_w": 25, "nvidia_pl": 65, "governor": "schedutil"},
+    "quiet":    {"ryzenadj_w": 18, "nvidia_pl": 45, "governor": "powersave"},
+}
+
+
+def sudo(args: list[str]) -> tuple[bool, str]:
+    r = subprocess.run(["sudo", "-n", *args], capture_output=True, text=True, timeout=10)
+    return r.returncode == 0, (r.stdout + r.stderr).strip()
+
+
+def apply_ryzenadj(w: int) -> tuple[bool, str]:
+    ryz = shutil.which("ryzenadj")
+    if not ryz:
+        return False, "ryzenadj no instalado"
+    mw = w * 1000
+    return sudo([ryz, f"--stapm-limit={mw}", f"--fast-limit={mw}", f"--slow-limit={mw}"])
+
+
+def apply_nvidia_pl(w: int) -> tuple[bool, str]:
+    if not shutil.which("nvidia-smi"):
+        return True, "nvidia-smi ausente, skip"
+    ok, msg = sudo(["nvidia-smi", "-pl", str(w)])
+    if "not supported" in msg.lower():
+        return True, "hardware firmware-locked, skip (no error)"
+    return ok, msg
+
+
+def apply_governor(gov: str) -> tuple[bool, str]:
+    cpup = shutil.which("cpupower")
+    if cpup:
+        return sudo([cpup, "frequency-set", "-g", gov])
+    # fallback: sysfs
+    paths = list(Path("/sys/devices/system/cpu").glob("cpu[0-9]*/cpufreq/scaling_governor"))
+    if not paths:
+        return False, "sin sysfs cpufreq"
+    ok_all = True
+    for p in paths:
+        ok, _ = sudo(["sh", "-c", f"echo {gov} > {p}"])
+        ok_all = ok_all and ok
+    return ok_all, f"sysfs governor → {gov}"
+
+
+def status() -> dict:
+    s = {"current": None}
+    if STATE.exists():
+        try:
+            s = json.loads(STATE.read_text())
+        except Exception:
+            pass
+    gov = Path("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    if gov.exists():
+        s["governor"] = gov.read_text().strip()
+    try:
+        r = subprocess.run(["nvidia-smi", "--query-gpu=power.limit,power.draw", "--format=csv,noheader,nounits"], capture_output=True, text=True, timeout=4)
+        if r.returncode == 0:
+            pl, pd = [x.strip() for x in r.stdout.strip().split(",")]
+            s["nvidia"] = {"power_limit_w": pl, "power_draw_w": pd}
+    except Exception:
+        pass
+    return s
+
+
+def main() -> int:
+    if len(sys.argv) < 2:
+        print("uso: system-ai-profile <perf|balanced|quiet|status>")
+        return 2
+    name = sys.argv[1]
+    if name == "status":
+        print(json.dumps(status(), indent=2, ensure_ascii=False))
+        return 0
+    if name not in PROFILES:
+        print(f"perfil desconocido: {name}. Opciones: {list(PROFILES)}", file=sys.stderr)
+        return 2
+    cfg = PROFILES[name]
+    results = {}
+    ok, msg = apply_ryzenadj(cfg["ryzenadj_w"])
+    results["ryzenadj"] = {"ok": ok, "msg": msg, "watts": cfg["ryzenadj_w"]}
+    ok, msg = apply_nvidia_pl(cfg["nvidia_pl"])
+    results["nvidia"] = {"ok": ok, "msg": msg, "pl": cfg["nvidia_pl"]}
+    ok, msg = apply_governor(cfg["governor"])
+    results["governor"] = {"ok": ok, "msg": msg, "gov": cfg["governor"]}
+    STATE.write_text(json.dumps({"current": name, "ts": int(time.time()), "results": results}, ensure_ascii=False))
+    print(json.dumps({"profile": name, **results}, indent=2, ensure_ascii=False))
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,341 @@
+#!/usr/bin/env -S /home/rixmerz/.local/share/system-ai-gestures-venv/bin/python
+"""
+system-ai-gestures — control de workspace via:
+  A) Mano: N dedos extendidos estables → workspace N (directo, sin confirmar).
+  B) Cabeza: giro brusco (cambio rápido de posición horizontal de nariz) → ws prev/next.
+
+Sin auto-start (privacidad).
+"""
+from __future__ import annotations
+import argparse
+import json
+import math
+import os
+import subprocess
+import sys
+import time
+from collections import Counter, deque
+from pathlib import Path
+
+import cv2
+import numpy as np
+import mediapipe as mp
+from mediapipe.tasks import python as mp_python
+from mediapipe.tasks.python import vision as mp_vision
+
+LOG = Path.home() / ".local/state/system-ai-gestures.log"
+LOG.parent.mkdir(parents=True, exist_ok=True)
+HAND_MODEL = Path.home() / ".local/share/system-ai/hand_landmarker.task"
+FACE_MODEL = Path.home() / ".local/share/system-ai/face_landmarker.task"
+
+CAM_INDEX = int(os.environ.get("GEST_CAM", "0"))
+FRAME_W = 320
+FRAME_H = 240
+TARGET_FPS = int(os.environ.get("GEST_FPS", "30"))
+COOLDOWN_S = float(os.environ.get("GEST_COOLDOWN", "1.0"))
+MIN_DETECTION_CONF = 0.5
+
+# Hand count
+STABLE_FRAMES = int(os.environ.get("STABLE_FRAMES", "8"))
+STABLE_MIN_S = float(os.environ.get("STABLE_MIN_S", "0.3"))
+FIST_WS = int(os.environ.get("GEST_FIST_WS", "10"))
+FINGER_THRESHOLDS = {
+    "thumb":  float(os.environ.get("THUMB_THR",  "0.95")),
+    "index":  float(os.environ.get("INDEX_THR",  "1.90")),
+    "middle": float(os.environ.get("MIDDLE_THR", "1.90")),
+    "ring":   float(os.environ.get("RING_THR",   "1.90")),
+    "pinky":  float(os.environ.get("PINKY_THR",  "1.45")),
+}
+FINGER_TIPS = {"thumb": 4, "index": 8, "middle": 12, "ring": 16, "pinky": 20}
+
+# Head turn (giro brusco)
+HEAD_MIN_DX = float(os.environ.get("HEAD_MIN_DX", "0.07"))     # cambio mínimo posición nariz x
+HEAD_MAX_DT = float(os.environ.get("HEAD_MAX_DT", "0.50"))     # debe ocurrir en menos de
+HEAD_MIN_VEL = float(os.environ.get("HEAD_MIN_VEL", "0.25"))   # dx/dt mínimo
+HEAD_POST_COOLDOWN_S = float(os.environ.get("HEAD_POST_COOLDOWN_S", "1.8"))  # bloquea recoil del cuello
+PREVIEW_TIMEOUT_S = float(os.environ.get("PREVIEW_TIMEOUT_S", "3.0"))
+HEAD_MIN_FRAMES = int(os.environ.get("HEAD_MIN_FRAMES", "3"))
+
+HAND_CONNECTIONS = [
+    (0,1),(1,2),(2,3),(3,4),
+    (0,5),(5,6),(6,7),(7,8),
+    (5,9),(9,10),(10,11),(11,12),
+    (9,13),(13,14),(14,15),(15,16),
+    (13,17),(17,18),(18,19),(19,20),
+    (0,17),
+]
+NOSE_TIP = 1  # face mesh: landmark 1 = nose tip
+
+
+def log(d: dict) -> None:
+    d["ts"] = time.time()
+    with LOG.open("a") as f:
+        f.write(json.dumps(d, ensure_ascii=False) + "\n")
+
+
+def hyprctl(cmd: list[str]) -> None:
+    try:
+        subprocess.run(["hyprctl", *cmd], capture_output=True, text=True, timeout=2)
+    except Exception as e:
+        log({"event": "hyprctl_fail", "msg": str(e)})
+
+
+def notify(title: str, body: str) -> None:
+    subprocess.run(["notify-send", "-a", "system-ai-gestures", "-t", "1000", title, body], check=False)
+
+
+# ── Hand helpers ───────────────────────────────────────────────────────────────
+def _palm_center(lm):
+    pts = (lm[0], lm[5], lm[9], lm[13], lm[17])
+    return sum(p.x for p in pts) / 5, sum(p.y for p in pts) / 5
+
+
+def _palm_scale(lm) -> float:
+    return math.hypot(lm[5].x - lm[17].x, lm[5].y - lm[17].y)
+
+
+def _tip_dist_norm(lm, tip_idx: int) -> float:
+    cx, cy = _palm_center(lm)
+    s = _palm_scale(lm)
+    if s == 0:
+        return 0.0
+    return math.hypot(lm[tip_idx].x - cx, lm[tip_idx].y - cy) / s
+
+
+def fingers_status(lm) -> dict:
+    return {name: _tip_dist_norm(lm, idx) > FINGER_THRESHOLDS[name] for name, idx in FINGER_TIPS.items()}
+
+
+def finger_metrics(lm) -> dict:
+    return {name: _tip_dist_norm(lm, idx) for name, idx in FINGER_TIPS.items()}
+
+
+def count_fingers(lm) -> int:
+    return sum(1 for v in fingers_status(lm).values() if v)
+
+
+def count_to_ws(n: int) -> int | None:
+    if n == 0:
+        return FIST_WS if FIST_WS > 0 else None
+    if 1 <= n <= 5:
+        return n
+    return None
+
+
+# ── Overlay ────────────────────────────────────────────────────────────────────
+def draw_overlay(frame, hand_lm, face_lm, count, stable_frames_have, last_fired, target_ws, head_dx, head_vel, msg):
+    h, w = frame.shape[:2]
+    if hand_lm:
+        pts = [(int(lm.x * w), int(lm.y * h)) for lm in hand_lm]
+        for a, b in HAND_CONNECTIONS:
+            cv2.line(frame, pts[a], pts[b], (0, 255, 0), 2)
+        for i, p in enumerate(pts):
+            cv2.circle(frame, p, 3, (0,0,255) if i == 0 else (255,200,0), -1)
+    if face_lm:
+        nx = int(face_lm[NOSE_TIP].x * w); ny = int(face_lm[NOSE_TIP].y * h)
+        cv2.circle(frame, (nx, ny), 5, (255, 0, 255), -1)
+    big = f"{count if count is not None else '-'}"
+    cv2.putText(frame, big, (w - 60, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (0,0,0), 5)
+    cv2.putText(frame, big, (w - 60, h - 18), cv2.FONT_HERSHEY_SIMPLEX, 1.6, (255,255,0), 2)
+    lines = [
+        f"count={count} stable {stable_frames_have}/{STABLE_FRAMES}",
+        f"last_fired ws={last_fired}  target={target_ws or '-'}",
+        f"head dx={head_dx:+.2f} vel={head_vel:.2f}",
+    ]
+    if hand_lm:
+        m = finger_metrics(hand_lm); s = fingers_status(hand_lm)
+        for n in ("thumb","index","middle","ring","pinky"):
+            mark = "✓" if s[n] else "·"
+            lines.append(f"{mark} {n:6s} d={m[n]:.2f}")
+    if msg:
+        lines.append(f">> {msg}")
+    y = 16
+    for ln in lines:
+        cv2.putText(frame, ln, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0,0,0), 3)
+        cv2.putText(frame, ln, (8, y), cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255,255,255), 1)
+        y += 16
+    return frame
+
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--debug", action="store_true")
+    args = ap.parse_args()
+
+    if not HAND_MODEL.exists() or not FACE_MODEL.exists():
+        notify("system-ai-gestures", "faltan modelos hand/face")
+        return 2
+
+    cap = cv2.VideoCapture(CAM_INDEX, cv2.CAP_V4L2)
+    if not cap.isOpened():
+        notify("system-ai-gestures", "no abre cámara")
+        return 1
+    cap.set(cv2.CAP_PROP_FRAME_WIDTH, FRAME_W)
+    cap.set(cv2.CAP_PROP_FRAME_HEIGHT, FRAME_H)
+    cap.set(cv2.CAP_PROP_FPS, TARGET_FPS)
+
+    hand_opts = mp_vision.HandLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(HAND_MODEL)),
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_hands=1,
+        min_hand_detection_confidence=MIN_DETECTION_CONF,
+        min_tracking_confidence=0.5,
+    )
+    hand_lmk = mp_vision.HandLandmarker.create_from_options(hand_opts)
+
+    face_opts = mp_vision.FaceLandmarkerOptions(
+        base_options=mp_python.BaseOptions(model_asset_path=str(FACE_MODEL)),
+        running_mode=mp_vision.RunningMode.VIDEO,
+        num_faces=1,
+    )
+    face_lmk = mp_vision.FaceLandmarker.create_from_options(face_opts)
+
+    notify("system-ai-gestures", "iniciado (mano cuenta + giro cabeza)")
+    log({"event": "start"})
+    start_t = time.time()
+    frame_interval = 1.0 / TARGET_FPS
+
+    # Hand state
+    stable_count = None
+    stable_since = 0.0
+    stable_frames_have = 0
+    last_fired_ws = 0
+    last_action_ts = 0.0
+    recent_counts: deque[int] = deque(maxlen=5)
+
+    # Head state
+    nose_buf: deque[tuple[float, float]] = deque(maxlen=30)
+    last_head_ts = 0.0
+    # Preview state (mano arma → giro cabeza confirma)
+    preview_ws: int | None = None
+    preview_since = 0.0
+
+    msg = ""
+    msg_until = 0.0
+
+    try:
+        while True:
+            t0 = time.time()
+            ok, frame = cap.read()
+            if not ok:
+                time.sleep(0.1)
+                continue
+            frame = cv2.flip(frame, 1)
+            rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+            mp_image = mp.Image(image_format=mp.ImageFormat.SRGB, data=rgb)
+            ts_ms = int((time.time() - start_t) * 1000)
+
+            hand_res = hand_lmk.detect_for_video(mp_image, ts_ms)
+            face_res = face_lmk.detect_for_video(mp_image, ts_ms)
+
+            now = time.time()
+            hand_lm = hand_res.hand_landmarks[0] if hand_res.hand_landmarks else None
+            face_lm = face_res.face_landmarks[0] if face_res.face_landmarks else None
+
+            # ── 1. HAND COUNT ──
+            raw = count_fingers(hand_lm) if hand_lm else None
+            if raw is not None:
+                recent_counts.append(raw)
+                top = Counter(recent_counts).most_common(1)[0]
+                count = top[0] if top[1] >= 3 else raw
+            else:
+                recent_counts.clear()
+                count = None
+            target_ws = count_to_ws(count) if count is not None else None
+
+            if count is None:
+                stable_count = None; stable_since = 0.0; stable_frames_have = 0
+            else:
+                if count == stable_count:
+                    stable_frames_have += 1
+                else:
+                    stable_count = count; stable_since = now; stable_frames_have = 1
+
+            # mano arma preview en lugar de disparar directo
+            can_preview = (
+                stable_count is not None
+                and target_ws is not None
+                and stable_frames_have >= STABLE_FRAMES
+                and (now - stable_since) >= STABLE_MIN_S
+                and (now - last_action_ts) >= COOLDOWN_S
+            )
+            if can_preview and preview_ws != target_ws:
+                preview_ws = target_ws
+                preview_since = now
+                notify(f"preview ws {target_ws}", f"{stable_count} dedo(s) — giro cabeza confirma")
+                log({"event": "preview", "count": stable_count, "ws": target_ws})
+                msg = f"preview ws {target_ws} (girar cabeza)"; msg_until = now + 2.0
+
+            # preview timeout
+            if preview_ws is not None and (now - preview_since) > PREVIEW_TIMEOUT_S:
+                log({"event": "preview_timeout", "ws": preview_ws})
+                preview_ws = None
+
+            # ── 2. HEAD TURN (giro brusco) ──
+            head_dx = 0.0; head_vel = 0.0
+            if face_lm:
+                nose_buf.append((now, face_lm[NOSE_TIP].x))
+                while nose_buf and now - nose_buf[0][0] > HEAD_MAX_DT * 1.5:
+                    nose_buf.popleft()
+            else:
+                # cara perdida → vaciar rápido
+                while nose_buf and now - nose_buf[0][0] > 0.2:
+                    nose_buf.popleft()
+
+            if (now - last_action_ts) >= COOLDOWN_S and (now - last_head_ts) >= HEAD_POST_COOLDOWN_S and len(nose_buf) >= HEAD_MIN_FRAMES:
+                xs = [(t, x) for t, x in nose_buf if (now - t) <= HEAD_MAX_DT]
+                if len(xs) >= HEAD_MIN_FRAMES:
+                    i_min = min(range(len(xs)), key=lambda i: xs[i][1])
+                    i_max = max(range(len(xs)), key=lambda i: xs[i][1])
+                    x_lo = xs[i_min][1]; x_hi = xs[i_max][1]
+                    dx_abs = x_hi - x_lo
+                    t_lo = xs[i_min][0]; t_hi = xs[i_max][0]
+                    dt = abs(t_hi - t_lo)
+                    vel = dx_abs / dt if dt > 0 else 0.0
+                    head_dx = dx_abs if t_hi > t_lo else -dx_abs
+                    head_vel = vel
+                    if dx_abs >= HEAD_MIN_DX and dt > 0 and dt <= HEAD_MAX_DT and vel >= HEAD_MIN_VEL:
+                        direction = "right" if t_hi > t_lo else "left"
+                        if preview_ws is not None:
+                            # confirma preview, ignora dirección, fija ws N
+                            hyprctl(["dispatch", "workspace", str(preview_ws)])
+                            notify(f"✓ ws {preview_ws}", "confirmado por giro")
+                            log({"event": "switch", "source": "hand+head", "ws": preview_ws})
+                            msg = f"WS {preview_ws} (confirm)"; msg_until = now + 1.0
+                            last_fired_ws = preview_ws
+                            preview_ws = None
+                        else:
+                            ws = "e+1" if direction == "right" else "e-1"
+                            hyprctl(["dispatch", "workspace", ws])
+                            notify("giro cabeza", f"{'→' if direction=='right' else '←'} {ws}")
+                            log({"event": "switch", "source": "head", "direction": direction, "dx": round(dx_abs,3), "dt": round(dt,3), "vel": round(vel,2)})
+                            msg = f"WS {ws} (head)"; msg_until = now + 1.0
+                        last_action_ts = now
+                        last_head_ts = now
+                        nose_buf.clear()
+
+            if args.debug:
+                if now > msg_until:
+                    msg = ""
+                bgr = cv2.cvtColor(rgb, cv2.COLOR_RGB2BGR)
+                bgr = draw_overlay(bgr, hand_lm, face_lm, count, stable_frames_have, last_fired_ws, target_ws, head_dx, head_vel, msg)
+                cv2.imshow("system-ai-gestures (q=salir)", bgr)
+                if (cv2.waitKey(1) & 0xFF) == ord("q"):
+                    break
+
+            elapsed = time.time() - t0
+            if elapsed < frame_interval:
+                time.sleep(frame_interval - elapsed)
+    except KeyboardInterrupt:
+        log({"event": "stop"})
+    finally:
+        cap.release()
+        hand_lmk.close(); face_lmk.close()
+        if args.debug:
+            cv2.destroyAllWindows()
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

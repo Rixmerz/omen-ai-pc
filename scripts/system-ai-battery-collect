@@ -1,0 +1,102 @@
+#!/usr/bin/env python3
+"""
+system-ai-battery-collect — sample battery + workload cada minuto a sqlite.
+Llamado por timer; lectura barata.
+"""
+from __future__ import annotations
+import json
+import sqlite3
+import subprocess
+import time
+from pathlib import Path
+
+DB = Path.home() / ".local/share/system-ai/battery.db"
+DB.parent.mkdir(parents=True, exist_ok=True)
+
+
+def db_init() -> sqlite3.Connection:
+    c = sqlite3.connect(DB)
+    c.execute("""CREATE TABLE IF NOT EXISTS samples (
+        ts INTEGER PRIMARY KEY,
+        capacity_pct INTEGER,
+        energy_uwh INTEGER,
+        power_uw INTEGER,
+        status TEXT,
+        ac_online INTEGER,
+        workload TEXT,
+        profile TEXT
+    )""")
+    c.execute("CREATE INDEX IF NOT EXISTS samples_ts ON samples(ts DESC)")
+    return c
+
+
+def read_int(p: Path) -> int | None:
+    try:
+        return int(p.read_text().strip())
+    except Exception:
+        return None
+
+
+def read_str(p: Path) -> str:
+    try:
+        return p.read_text().strip()
+    except Exception:
+        return ""
+
+
+def workload_hint() -> str:
+    try:
+        r = subprocess.run(["hyprctl", "activewindow", "-j"], capture_output=True, text=True, timeout=2)
+        cls = (json.loads(r.stdout).get("class") or "").lower() if r.returncode == 0 else ""
+        if any(k in cls for k in ("steam", "gamescope", "lutris", "wine", "heroic")):
+            return "game"
+        if any(k in cls for k in ("code", "codium", "neovim", "jetbrains", "pycharm", "ghostty", "kitty", "alacritty", "wezterm")):
+            return "code"
+        if any(k in cls for k in ("firefox", "chromium", "brave", "librewolf")):
+            return "browse"
+        if any(k in cls for k in ("mpv", "vlc", "obs", "blender")):
+            return "media"
+    except Exception:
+        pass
+    return "default"
+
+
+def current_profile() -> str:
+    p = Path.home() / ".local/state/system-ai-profile.json"
+    if p.exists():
+        try:
+            return json.loads(p.read_text()).get("current", "")
+        except Exception:
+            pass
+    return ""
+
+
+def main() -> int:
+    bats = list(Path("/sys/class/power_supply").glob("BAT*"))
+    if not bats:
+        return 0
+    bat = bats[0]
+    cap = read_int(bat / "capacity")
+    enow = read_int(bat / "energy_now")
+    pnow = read_int(bat / "power_now")
+    status = read_str(bat / "status")
+    ac = 0
+    for a in Path("/sys/class/power_supply").glob("A*"):
+        if (a / "online").exists():
+            ac = int(read_str(a / "online") or "0")
+            break
+
+    c = db_init()
+    c.execute(
+        "INSERT OR REPLACE INTO samples (ts, capacity_pct, energy_uwh, power_uw, status, ac_online, workload, profile) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        (int(time.time()), cap, enow, pnow, status, ac, workload_hint(), current_profile()),
+    )
+    c.commit()
+    # GC: mantener últimos 30 días
+    c.execute("DELETE FROM samples WHERE ts < ?", (int(time.time()) - 30 * 86400,))
+    c.commit()
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

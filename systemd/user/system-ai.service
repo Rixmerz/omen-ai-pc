@@ -1,0 +1,9 @@
+[Unit]
+Description=system-ai observer (LLM-driven system health summarizer)
+After=ollama.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/system-ai-observer
+Nice=10
+IOSchedulingClass=idle

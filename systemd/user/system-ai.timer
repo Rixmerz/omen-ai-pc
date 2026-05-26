@@ -1,0 +1,11 @@
+[Unit]
+Description=Run system-ai observer periodically
+
+[Timer]
+OnBootSec=3min
+OnUnitActiveSec=5min
+AccuracySec=30s
+Persistent=false
+
+[Install]
+WantedBy=default.target

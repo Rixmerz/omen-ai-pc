@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""
+system-ai-daily-report — resumen diario.
+Lee últimas 24h de system-ai.log + actions.log, pide al LLM resumen
+de tendencias, peaks, acciones. Guarda en ~/Documents/system-ai/.
+Notif al terminar.
+"""
+from __future__ import annotations
+import json
+import subprocess
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+MODEL = "qwen2.5-coder:7b-instruct-q4_K_M"
+LOG = Path.home() / ".local/state/system-ai.log"
+ACTIONS = Path.home() / ".local/state/system-ai-actions.log"
+OUT_DIR = Path.home() / "Documents/system-ai"
+OUT_DIR.mkdir(parents=True, exist_ok=True)
+
+
+def load_jsonl(path: Path, since_ts: int) -> list[dict]:
+    out = []
+    if not path.exists():
+        return out
+    with path.open() as f:
+        for line in f:
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                d = json.loads(line)
+            except Exception:
+                continue
+            if d.get("ts", 0) >= since_ts:
+                out.append(d)
+    return out
+
+
+def aggregate(events: list[dict]) -> dict:
+    if not events:
+        return {"count": 0}
+    # Filter legacy entries where verdict was a string (Fase 1)
+    events = [e for e in events if isinstance(e.get("verdict"), dict)]
+    if not events:
+        return {"count": 0}
+    anomalies = [e for e in events if e["verdict"].get("anomaly")]
+    peaks = {
+        "ram_pct_max": 0,
+        "cpu_temp_max": 0,
+        "gpu_temp_max": 0,
+        "swap_pct_max": 0,
+    }
+    procs = {}
+    for e in events:
+        snap = e.get("snap") or {}
+        peaks["ram_pct_max"] = max(peaks["ram_pct_max"], snap.get("ram_pct") or 0)
+        peaks["cpu_temp_max"] = max(peaks["cpu_temp_max"], snap.get("cpu_temp_c") or 0)
+        peaks["swap_pct_max"] = max(peaks["swap_pct_max"], snap.get("swap_pct") or 0)
+        gpu = snap.get("gpu", {})
+        peaks["gpu_temp_max"] = max(peaks["gpu_temp_max"], gpu.get("temp_c") or 0)
+        for p in snap.get("top_procs", []):
+            n = p.get("comm")
+            if n:
+                procs[n] = max(procs.get(n, 0), p.get("rss_mb", 0))
+    top_procs_sorted = sorted(procs.items(), key=lambda x: -x[1])[:5]
+    return {
+        "count": len(events),
+        "anomalies": len(anomalies),
+        "peaks": peaks,
+        "top_procs_24h": [{"comm": k, "max_rss_mb": v} for k, v in top_procs_sorted],
+        "anomaly_metrics": [a["verdict"].get("metric") for a in anomalies][:10],
+    }
+
+
+SYSTEM = """Generás un reporte diario del sistema en formato Markdown. 6-12 líneas máximo. Tono técnico breve. Español. Sin saludos. Estructura:
+
+## Reporte $(fecha)
+- **Salud general:** ...
+- **Peaks 24h:** RAM X%, CPU YC, GPU ZC
+- **Procesos top:** ...
+- **Anomalías detectadas:** ...
+- **Acciones ejecutadas:** ...
+- **Recomendación:** 1 línea concreta o "Sistema nominal"."""
+
+
+def ask(payload: dict) -> str:
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+        "stream": False,
+        "options": {"temperature": 0.2, "num_ctx": 4096},
+    }
+    req = urllib.request.Request(OLLAMA_URL, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            return json.loads(r.read()).get("message", {}).get("content", "").strip()
+    except Exception as e:
+        return f"[ERR] {e}"
+
+
+def main() -> int:
+    now = int(time.time())
+    since = now - 86400
+    events = load_jsonl(LOG, since)
+    actions = load_jsonl(ACTIONS, since)
+    agg = aggregate(events)
+    agg["actions_24h"] = [{"tool": a.get("tool") or a.get("verdict", {}).get("exec", {}).get("tool"), "ok": a.get("ok"), "msg": a.get("msg")} for a in actions]
+    agg["date"] = time.strftime("%Y-%m-%d")
+
+    report = ask(agg)
+    out = OUT_DIR / f"{agg['date']}.md"
+    out.write_text(report + "\n\n---\nRaw stats:\n```json\n" + json.dumps(agg, indent=2, ensure_ascii=False) + "\n```\n")
+    subprocess.run(["notify-send", "-a", "system-ai", "system-ai daily", f"reporte → {out}"], check=False)
+    print(report)
+    print(f"\nFile: {out}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

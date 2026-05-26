@@ -1,0 +1,121 @@
+#!/usr/bin/env python3
+"""
+ai-ask — query libre al LLM local con contexto del sistema.
+Uso: ai-ask "por qué está lento?"   |   echo "explica esto" | ai-ask
+"""
+from __future__ import annotations
+import json
+import os
+import subprocess
+import sys
+import urllib.request
+from pathlib import Path
+
+OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+MODEL = "qwen2.5-coder:7b-instruct-q4_K_M"
+
+
+def run(cmd: list[str], timeout: int = 4) -> str:
+    try:
+        return subprocess.check_output(cmd, timeout=timeout, text=True, stderr=subprocess.DEVNULL)
+    except Exception:
+        return ""
+
+
+def snapshot() -> dict:
+    snap: dict = {}
+    try:
+        mi = {}
+        for line in Path("/proc/meminfo").read_text().splitlines()[:8]:
+            k, _, v = line.partition(":")
+            mi[k.strip()] = v.strip()
+        snap["mem"] = {"MemTotal": mi.get("MemTotal"), "MemAvailable": mi.get("MemAvailable"), "SwapFree": mi.get("SwapFree")}
+    except Exception:
+        pass
+    snap["load"] = Path("/proc/loadavg").read_text().split()[:3] if Path("/proc/loadavg").exists() else []
+    sj = run(["sensors", "-j"])
+    if sj:
+        try:
+            s = json.loads(sj)
+            snap["temps"] = {
+                "cpu": s.get("k10temp-pci-00c3", {}).get("Tctl", {}).get("temp1_input"),
+                "igpu": s.get("amdgpu-pci-0600", {}).get("edge", {}).get("temp1_input"),
+                "nvme": s.get("nvme-pci-0500", {}).get("Composite", {}).get("temp1_input"),
+            }
+        except Exception:
+            pass
+    nv = run(["nvidia-smi", "--query-gpu=temperature.gpu,utilization.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"])
+    if nv.strip():
+        try:
+            t, u, mu, mt = [int(x.strip()) for x in nv.strip().split(",")]
+            snap["gpu_nvidia"] = {"temp": t, "util": u, "vram_used": mu, "vram_total": mt}
+        except Exception:
+            pass
+    ps = run(["ps", "-eo", "pid,rss,pcpu,comm", "--sort=-rss", "--no-headers"])
+    snap["top_procs"] = []
+    for line in ps.splitlines()[:6]:
+        p = line.strip().split(None, 3)
+        if len(p) == 4 and int(p[1]) // 1024 > 100:
+            snap["top_procs"].append({"pid": int(p[0]), "rss_mb": int(p[1])//1024, "cpu": float(p[2]), "comm": p[3][:30]})
+    # batería
+    for bat in Path("/sys/class/power_supply").glob("BAT*"):
+        try:
+            snap["battery"] = {
+                "status": (bat/"status").read_text().strip(),
+                "pct": int((bat/"capacity").read_text()),
+                "draw_w": round(int((bat/"power_now").read_text())/1e6, 1) if (bat/"power_now").exists() else None,
+            }
+        except Exception:
+            pass
+    for ac in Path("/sys/class/power_supply").glob("A*"):
+        if (ac/"online").exists():
+            snap["ac_online"] = (ac/"online").read_text().strip() == "1"
+            break
+    return snap
+
+
+SYSTEM = """Asistente del sistema en una laptop HP OMEN Arch+Hyprland (Ryzen 7 4800H, RTX 2060 Mobile 6GB, 16GB RAM). Respondé directo, español, máximo 5 líneas. Sin disclaimers, sin saludos. Si la pregunta es técnica usá los datos del snapshot. Si no es relevante, ignoralo. Sé conciso como caveman: fragmentos OK."""
+
+
+def main() -> int:
+    q = " ".join(sys.argv[1:]).strip()
+    if not q and not sys.stdin.isatty():
+        q = sys.stdin.read().strip()
+    if not q:
+        print("uso: ai-ask <pregunta>   |   echo q | ai-ask", file=sys.stderr)
+        return 2
+
+    snap = snapshot()
+    user = f"Pregunta: {q}\n\nSnapshot sistema:\n{json.dumps(snap, ensure_ascii=False)}"
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": user}],
+        "stream": True,
+        "options": {"temperature": 0.3, "num_ctx": 4096},
+    }
+    req = urllib.request.Request(OLLAMA_URL, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            for line in r:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except Exception:
+                    continue
+                tok = chunk.get("message", {}).get("content", "")
+                if tok:
+                    sys.stdout.write(tok)
+                    sys.stdout.flush()
+                if chunk.get("done"):
+                    sys.stdout.write("\n")
+                    break
+    except Exception as e:
+        print(f"\n[ERR ollama]: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

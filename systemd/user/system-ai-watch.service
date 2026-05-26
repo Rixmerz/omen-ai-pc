@@ -1,0 +1,14 @@
+[Unit]
+Description=system-ai journal watcher (triggers observer on error bursts)
+After=ollama.service
+
+[Service]
+Type=simple
+ExecStart=%h/.local/bin/system-ai-watch-journal
+Restart=on-failure
+RestartSec=10s
+Nice=15
+IOSchedulingClass=idle
+
+[Install]
+WantedBy=default.target

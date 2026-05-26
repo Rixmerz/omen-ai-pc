@@ -1,0 +1,78 @@
+#!/usr/bin/env python3
+"""
+ai-boot-analyze — resume el último arranque: timings + errores + tasks lentas.
+"""
+from __future__ import annotations
+import json
+import subprocess
+import sys
+import urllib.request
+
+OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+MODEL = "qwen2.5-coder:7b-instruct-q4_K_M"
+
+
+def run(cmd: list[str], timeout: int = 10) -> str:
+    try:
+        return subprocess.check_output(cmd, timeout=timeout, text=True, stderr=subprocess.STDOUT)
+    except Exception as e:
+        return f"[err: {e}]"
+
+
+def collect() -> str:
+    parts = []
+    parts.append("== systemd-analyze ==")
+    parts.append(run(["systemd-analyze"]))
+    parts.append("\n== blame top 15 ==")
+    parts.append("\n".join(run(["systemd-analyze", "blame", "--no-pager"]).splitlines()[:15]))
+    parts.append("\n== critical-chain ==")
+    parts.append(run(["systemd-analyze", "critical-chain", "--no-pager"]))
+    parts.append("\n== failed units ==")
+    parts.append(run(["systemctl", "--failed", "--no-legend", "--no-pager"]))
+    parts.append("\n== journal -b -p err ==")
+    parts.append(run(["journalctl", "-b", "-p", "err", "--no-pager", "-n", "60"]))
+    return "\n".join(parts)
+
+
+SYSTEM = """Analizá la salud del arranque Arch+Hyprland. Markdown, máximo 10 líneas. Español. Estructura:
+- **Tiempo total:** ...
+- **Cuellos de botella (top 3):** ...
+- **Servicios fallidos:** ... o 'ninguno'
+- **Errores notables:** resumir agrupado, no listar todos.
+- **Acción sugerida:** 1 línea concreta o 'arranque sano'."""
+
+
+def main() -> int:
+    data = collect()[-16000:]
+    body = {
+        "model": MODEL,
+        "messages": [{"role": "system", "content": SYSTEM}, {"role": "user", "content": data}],
+        "stream": True,
+        "options": {"temperature": 0.2, "num_ctx": 8192},
+    }
+    req = urllib.request.Request(OLLAMA_URL, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+    try:
+        with urllib.request.urlopen(req, timeout=180) as r:
+            for line in r:
+                line = line.strip()
+                if not line:
+                    continue
+                try:
+                    chunk = json.loads(line)
+                except Exception:
+                    continue
+                tok = chunk.get("message", {}).get("content", "")
+                if tok:
+                    sys.stdout.write(tok)
+                    sys.stdout.flush()
+                if chunk.get("done"):
+                    sys.stdout.write("\n")
+                    break
+    except Exception as e:
+        print(f"\n[ERR]: {e}", file=sys.stderr)
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

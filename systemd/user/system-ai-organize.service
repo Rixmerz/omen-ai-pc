@@ -1,0 +1,9 @@
+[Unit]
+Description=system-ai proactive downloads organizer
+After=ollama.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/system-ai-organize
+Nice=15
+IOSchedulingClass=idle

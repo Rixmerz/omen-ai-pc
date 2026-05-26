@@ -1,0 +1,8 @@
+[Unit]
+Description=system-ai daily report
+After=ollama.service
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/system-ai-daily-report
+Nice=15

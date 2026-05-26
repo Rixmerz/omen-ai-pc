@@ -1,0 +1,160 @@
+#!/usr/bin/env python3
+"""
+ai-battery — predicción inteligente batería basada en historial.
+
+Uso:
+  ai-battery               # ETA + drain breakdown
+  ai-battery --verbose     # + por workload + por profile
+  ai-battery --explain     # LLM resume + sugerencia
+"""
+from __future__ import annotations
+import argparse
+import json
+import sqlite3
+import sys
+import time
+import urllib.request
+from pathlib import Path
+
+DB = Path.home() / ".local/share/system-ai/battery.db"
+OLLAMA_URL = "http://127.0.0.1:11434/api/chat"
+MODEL = "qwen2.5-coder:7b-instruct-q4_K_M"
+
+
+def fmt_eta(seconds: float) -> str:
+    if seconds <= 0 or seconds > 1e7:
+        return "?"
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    if h:
+        return f"{h}h{m:02d}m"
+    return f"{m}m"
+
+
+def latest_sample(c: sqlite3.Connection) -> dict | None:
+    r = c.execute("SELECT ts,capacity_pct,energy_uwh,power_uw,status,ac_online,workload,profile FROM samples ORDER BY ts DESC LIMIT 1").fetchone()
+    if not r:
+        return None
+    return dict(zip(["ts","cap","energy","power","status","ac","workload","profile"], r))
+
+
+def avg_power(c: sqlite3.Connection, window_min: int, only_discharge: bool = True) -> tuple[float, int]:
+    since = int(time.time()) - window_min * 60
+    where = "ts >= ? AND power_uw IS NOT NULL"
+    if only_discharge:
+        where += " AND status='Discharging'"
+    rows = c.execute(f"SELECT power_uw FROM samples WHERE {where}", (since,)).fetchall()
+    if not rows:
+        return 0.0, 0
+    powers = [r[0] for r in rows if r[0] is not None]
+    if not powers:
+        return 0.0, 0
+    return sum(powers) / len(powers), len(powers)
+
+
+def breakdown(c: sqlite3.Connection, col: str, window_min: int = 1440) -> list[tuple[str, float, int]]:
+    since = int(time.time()) - window_min * 60
+    rows = c.execute(
+        f"SELECT {col}, AVG(power_uw), COUNT(*) FROM samples WHERE ts >= ? AND status='Discharging' AND power_uw IS NOT NULL GROUP BY {col} ORDER BY 2 DESC",
+        (since,),
+    ).fetchall()
+    return [(k or "?", v, n) for k, v, n in rows]
+
+
+def predict(snap: dict, mean_uw: float) -> str:
+    if snap.get("ac"):
+        return f"AC enchufado — carga: {snap['status']} ({snap['cap']}%)"
+    energy = snap.get("energy") or 0
+    if mean_uw <= 0 or energy <= 0:
+        return "datos insuficientes"
+    sec = energy / mean_uw * 3600
+    return fmt_eta(sec)
+
+
+def fmt_w(uw: float) -> str:
+    return f"{uw/1e6:.1f}W"
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--verbose", "-v", action="store_true")
+    ap.add_argument("--explain", action="store_true")
+    args = ap.parse_args()
+
+    if not DB.exists():
+        print("Sin historial. Esperá unos minutos a que el collector recolecte samples.", file=sys.stderr)
+        return 1
+    c = sqlite3.connect(DB)
+
+    snap = latest_sample(c)
+    if not snap:
+        print("DB vacía", file=sys.stderr)
+        return 1
+
+    m5, n5 = avg_power(c, 5)
+    m15, n15 = avg_power(c, 15)
+    m60, n60 = avg_power(c, 60)
+
+    eta = predict(snap, m15 if n15 >= 3 else m5)
+
+    print(f"Estado:     {snap['status']}  AC={'sí' if snap['ac'] else 'no'}  perfil={snap['profile'] or '?'}")
+    print(f"Capacidad:  {snap['cap']}%  energía={(snap['energy'] or 0)/1e6:.1f}Wh")
+    print(f"Drain 5m:   {fmt_w(m5)} (n={n5})")
+    print(f"Drain 15m:  {fmt_w(m15)} (n={n15})")
+    print(f"Drain 60m:  {fmt_w(m60)} (n={n60})")
+    print(f"ETA estim:  {eta}")
+
+    if args.verbose:
+        print("\n-- por workload (24h) --")
+        for k, p, n in breakdown(c, "workload"):
+            print(f"  {k:10s}  {fmt_w(p)}  n={n}")
+        print("\n-- por profile (24h) --")
+        for k, p, n in breakdown(c, "profile"):
+            print(f"  {k:10s}  {fmt_w(p)}  n={n}")
+
+    if args.explain:
+        payload = {
+            "snap": snap,
+            "drain_5m_W": round(m5/1e6, 2),
+            "drain_15m_W": round(m15/1e6, 2),
+            "drain_60m_W": round(m60/1e6, 2),
+            "eta": eta,
+            "by_workload_24h": [(k, round(p/1e6, 2)) for k, p, n in breakdown(c, "workload")],
+            "by_profile_24h": [(k, round(p/1e6, 2)) for k, p, n in breakdown(c, "profile")],
+        }
+        sys_prompt = """Analista de batería en laptop Arch+Hyprland. Recibís datos. Markdown, máx 6 líneas, español:
+- **Estado:** 1 línea
+- **Tendencia:** comparar drain 5m vs 15m vs 60m, indicar si subiendo/bajando/estable
+- **Hot spot:** workload o profile con mayor drain
+- **Sugerencia:** acción concreta (cambiar profile, cerrar workload, enchufar) o "nominal" """
+        body = {
+            "model": MODEL,
+            "messages": [{"role": "system", "content": sys_prompt}, {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}],
+            "stream": True,
+            "options": {"temperature": 0.2, "num_ctx": 4096},
+        }
+        req = urllib.request.Request(OLLAMA_URL, data=json.dumps(body).encode(), headers={"Content-Type": "application/json"})
+        print("\n-- análisis LLM --")
+        try:
+            with urllib.request.urlopen(req, timeout=120) as r:
+                for line in r:
+                    line = line.strip()
+                    if not line:
+                        continue
+                    try:
+                        ch = json.loads(line)
+                    except Exception:
+                        continue
+                    t = ch.get("message", {}).get("content", "")
+                    if t:
+                        sys.stdout.write(t); sys.stdout.flush()
+                    if ch.get("done"):
+                        sys.stdout.write("\n"); break
+        except Exception as e:
+            print(f"[ERR]: {e}", file=sys.stderr)
+            return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

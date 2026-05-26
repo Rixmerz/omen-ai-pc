@@ -1,0 +1,82 @@
+#!/usr/bin/env python3
+"""
+system-ai-idle-tasks — corre tareas de mantenimiento cuando:
+  - AC conectado
+  - CPU temp < 70°C
+  - load1 < 1.5
+  - ai-search index pendiente (>6h sin re-indexar)
+Sino, sale silencioso.
+"""
+from __future__ import annotations
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+LOG = Path.home() / ".local/state/system-ai-idle.log"
+LOG.parent.mkdir(parents=True, exist_ok=True)
+STAMP = Path.home() / ".local/state/system-ai-search-lastindex"
+
+
+def log(msg: str) -> None:
+    with LOG.open("a") as f:
+        f.write(f"{int(time.time())} {msg}\n")
+
+
+def is_ac() -> bool:
+    for ac in Path("/sys/class/power_supply").glob("A*"):
+        if (ac / "online").exists():
+            return (ac / "online").read_text().strip() == "1"
+    return True  # asume sí si no sabe (desktop)
+
+
+def cpu_temp() -> float:
+    try:
+        sj = subprocess.run(["sensors", "-j"], capture_output=True, text=True, timeout=3).stdout
+        s = json.loads(sj)
+        t = s.get("k10temp-pci-00c3", {}).get("Tctl", {}).get("temp1_input")
+        return float(t) if t is not None else 0.0
+    except Exception:
+        return 0.0
+
+
+def load1() -> float:
+    try:
+        return float(Path("/proc/loadavg").read_text().split()[0])
+    except Exception:
+        return 0.0
+
+
+def search_index_due() -> bool:
+    if not STAMP.exists():
+        return True
+    return (time.time() - STAMP.stat().st_mtime) > 6 * 3600
+
+
+def main() -> int:
+    if not is_ac():
+        log("skip: not AC"); return 0
+    t = cpu_temp()
+    if t > 70:
+        log(f"skip: cpu_temp {t}°C"); return 0
+    l = load1()
+    if l > 1.5:
+        log(f"skip: load1 {l}"); return 0
+
+    log(f"OK ac=1 temp={t} load={l}")
+    actions = []
+
+    if search_index_due():
+        r = subprocess.run([str(Path.home() / ".local/bin/ai-search"), "index"], capture_output=True, text=True, timeout=1200)
+        actions.append(("ai-search index", r.returncode == 0, r.stdout.strip()[:200]))
+        STAMP.touch()
+
+    for name, ok, msg in actions:
+        log(f"{name}: ok={ok} {msg}")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())
