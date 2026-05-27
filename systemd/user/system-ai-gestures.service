@@ -8,5 +8,6 @@ ExecStart=%h/.local/bin/system-ai-gestures
 Restart=on-failure
 RestartSec=5s
 Nice=10
-# NO auto-enable — privacidad. Iniciar manualmente:
-#   systemctl --user start system-ai-gestures.service
+
+[Install]
+WantedBy=default.target
