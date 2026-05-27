@@ -8,6 +8,7 @@ ExecStart=%h/.local/bin/system-ai-gestures
 Restart=on-failure
 RestartSec=5s
 Nice=10
+PassEnvironment=HYPRLAND_INSTANCE_SIGNATURE XDG_RUNTIME_DIR WAYLAND_DISPLAY DISPLAY DBUS_SESSION_BUS_ADDRESS
 
 [Install]
 WantedBy=default.target
