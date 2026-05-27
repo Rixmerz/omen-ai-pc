@@ -1,0 +1,15 @@
+#!/bin/sh
+# /usr/lib/systemd/system-sleep/mpvpaper-pause
+# Pausa mpvpaper antes de suspend/hibernate para evitar deadlock con nvidia_uvm.
+
+case "$1/$2" in
+    pre/*)
+        pkill -STOP -x mpvpaper 2>/dev/null
+        pkill -STOP -x mpvpaper-holder 2>/dev/null
+        ;;
+    post/*)
+        pkill -CONT -x mpvpaper 2>/dev/null
+        pkill -CONT -x mpvpaper-holder 2>/dev/null
+        ;;
+esac
+exit 0
