@@ -1,0 +1,115 @@
+#!/usr/bin/env python3
+"""
+ai-dictate — graba audio + whisper.cpp transcribe + wtype escribe en focused window.
+
+Uso:
+  ai-dictate                # graba 8s, transcribe, escribe en ventana focused
+  ai-dictate -t 15          # 15 segundos
+  ai-dictate --enter        # presiona Enter al final
+  ai-dictate --no-type      # solo print (no escribe ni envía)
+  ai-dictate --lang en      # idioma específico (default: es)
+
+Deps:
+  pacman -S wtype
+  paru -S whisper.cpp-cuda        # AUR; o whisper.cpp para CPU
+  Modelo: curl -L --create-dirs -o ~/.local/share/whisper.cpp/ggml-base.bin \\
+            https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin
+"""
+from __future__ import annotations
+import argparse
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+WHISPER_BINS = ("whisper-cli", "whisper-cpp", "whisper.cpp", "main")
+WHISPER_MODELS = [
+    "/usr/share/whisper.cpp/models/ggml-base.bin",
+    "/usr/share/whisper.cpp/models/ggml-base.es.bin",
+    str(Path.home() / ".local/share/whisper.cpp/ggml-base.bin"),
+    str(Path.home() / ".local/share/whisper.cpp/ggml-base.es.bin"),
+]
+
+
+def find_first_existing(paths):
+    for p in paths:
+        if Path(p).exists():
+            return p
+    return None
+
+
+def find_whisper_bin():
+    for b in WHISPER_BINS:
+        x = shutil.which(b)
+        if x:
+            return x
+    return None
+
+
+def notify(title: str, body: str = "") -> None:
+    subprocess.run(["notify-send", "-a", "ai-dictate", "-i", "audio-input-microphone", "-t", "1500", title, body], check=False)
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("-t", "--seconds", type=int, default=8)
+    ap.add_argument("-l", "--lang", default="es")
+    ap.add_argument("--enter", action="store_true", help="presiona Enter después de escribir")
+    ap.add_argument("--no-type", action="store_true", help="solo print, no escribe en ventana")
+    args = ap.parse_args()
+
+    bin_ = find_whisper_bin()
+    model = find_first_existing(WHISPER_MODELS)
+    wtype = shutil.which("wtype")
+
+    if not bin_ or not model:
+        msg = "Falta whisper.cpp o modelo"
+        notify(msg, "ver --help para instalar")
+        print(f"[ERR] {msg}", file=sys.stderr)
+        print("  paru -S whisper.cpp-cuda    # o whisper.cpp", file=sys.stderr)
+        print("  curl -L --create-dirs -o ~/.local/share/whisper.cpp/ggml-base.bin \\", file=sys.stderr)
+        print("    https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.bin", file=sys.stderr)
+        return 2
+
+    if not args.no_type and not wtype:
+        notify("ai-dictate", "wtype no instalado — sudo pacman -S wtype")
+        print("[ERR] wtype no instalado — sudo pacman -S wtype", file=sys.stderr)
+        return 2
+
+    with tempfile.TemporaryDirectory() as td:
+        wav = Path(td) / "in.wav"
+        notify("🎤 Grabando…", f"{args.seconds}s")
+        r = subprocess.run(
+            ["arecord", "-q", "-f", "S16_LE", "-r", "16000", "-c", "1", "-d", str(args.seconds), str(wav)],
+            capture_output=True, text=True,
+        )
+        if r.returncode != 0 or not wav.exists():
+            notify("ai-dictate", "fallo arecord")
+            return 1
+        notify("🧠 Transcribiendo…")
+        out_base = wav.with_suffix("")
+        r = subprocess.run(
+            [bin_, "-m", model, "-f", str(wav), "-l", args.lang, "-nt", "--output-txt", "-of", str(out_base)],
+            capture_output=True, text=True, timeout=180,
+        )
+        txt_file = out_base.with_suffix(".txt")
+        text = txt_file.read_text().strip() if txt_file.exists() else (r.stdout or "").strip()
+        text = " ".join(text.split())  # squash whitespace
+        if not text:
+            notify("ai-dictate", "(sin transcripción)")
+            return 3
+        print(text)
+        if args.no_type:
+            notify("📝 Dictado", text[:200])
+            return 0
+        subprocess.run([wtype, text])
+        if args.enter:
+            subprocess.run([wtype, "-k", "Return"])
+        notify("✓ Dictado", text[:200])
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -56,6 +56,13 @@ HEAD_POST_COOLDOWN_S = float(os.environ.get("HEAD_POST_COOLDOWN_S", "1.8"))  # b
 PREVIEW_TIMEOUT_S = float(os.environ.get("PREVIEW_TIMEOUT_S", "3.0"))
 HEAD_MIN_FRAMES = int(os.environ.get("HEAD_MIN_FRAMES", "3"))
 
+# Dictado: ambas manos separadas
+DICTATE_ENABLE = os.environ.get("DICTATE_ENABLE", "1") == "1"
+DICTATE_TWO_HAND_THR = float(os.environ.get("DICTATE_TWO_HAND_THR", "0.45"))
+DICTATE_HOLD_S = float(os.environ.get("DICTATE_HOLD_S", "0.5"))
+DICTATE_SECONDS = int(os.environ.get("DICTATE_SECONDS", "8"))
+DICTATE_COOLDOWN_S = float(os.environ.get("DICTATE_COOLDOWN_S", "10"))
+
 HAND_CONNECTIONS = [
     (0,1),(1,2),(2,3),(3,4),
     (0,5),(5,6),(6,7),(7,8),
@@ -178,7 +185,7 @@ def main() -> int:
     hand_opts = mp_vision.HandLandmarkerOptions(
         base_options=mp_python.BaseOptions(model_asset_path=str(HAND_MODEL)),
         running_mode=mp_vision.RunningMode.VIDEO,
-        num_hands=1,
+        num_hands=2 if DICTATE_ENABLE else 1,
         min_hand_detection_confidence=MIN_DETECTION_CONF,
         min_tracking_confidence=0.5,
     )
@@ -207,6 +214,10 @@ def main() -> int:
     # Head state
     nose_buf: deque[tuple[float, float]] = deque(maxlen=30)
     last_head_ts = 0.0
+
+    # Dictate state
+    two_hand_since: float | None = None
+    last_dictate_ts = 0.0
     # Preview state (mano arma → giro cabeza confirma)
     preview_ws: int | None = None
     preview_since = 0.0
@@ -230,8 +241,31 @@ def main() -> int:
             face_res = face_lmk.detect_for_video(mp_image, ts_ms)
 
             now = time.time()
-            hand_lm = hand_res.hand_landmarks[0] if hand_res.hand_landmarks else None
+            all_hands = hand_res.hand_landmarks if hand_res.hand_landmarks else []
+            hand_lm = all_hands[0] if all_hands else None
             face_lm = face_res.face_landmarks[0] if face_res.face_landmarks else None
+
+            # ── DICTATE: dos manos separadas ──
+            if DICTATE_ENABLE and len(all_hands) >= 2 and (now - last_dictate_ts) > DICTATE_COOLDOWN_S:
+                sep = abs(all_hands[0][0].x - all_hands[1][0].x)  # |wrist1.x - wrist2.x|
+                if sep >= DICTATE_TWO_HAND_THR:
+                    if two_hand_since is None:
+                        two_hand_since = now
+                    elif (now - two_hand_since) >= DICTATE_HOLD_S:
+                        # Disparar dictate (no bloquear loop)
+                        notify("🎤 dictado", f"grabando {DICTATE_SECONDS}s + enter")
+                        log({"event": "dictate_trigger", "sep": round(sep, 3)})
+                        subprocess.Popen(
+                            [str(Path.home() / ".local/bin/ai-dictate"), "-t", str(DICTATE_SECONDS), "--enter"],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                            start_new_session=True,
+                        )
+                        last_dictate_ts = now
+                        two_hand_since = None
+                else:
+                    two_hand_since = None
+            else:
+                two_hand_since = None
 
             # ── 1. HAND COUNT ──
             raw = count_fingers(hand_lm) if hand_lm else None
