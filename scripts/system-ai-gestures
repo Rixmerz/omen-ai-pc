@@ -35,7 +35,8 @@ TARGET_FPS = int(os.environ.get("GEST_FPS", "30"))
 COOLDOWN_S = float(os.environ.get("GEST_COOLDOWN", "1.0"))
 MIN_DETECTION_CONF = 0.5
 
-# Hand count
+# Hand count → ws (DESACTIVADO por defecto — colisión con dictate)
+COUNT_WS_ENABLE = os.environ.get("COUNT_WS_ENABLE", "0") == "1"
 STABLE_FRAMES = int(os.environ.get("STABLE_FRAMES", "8"))
 STABLE_MIN_S = float(os.environ.get("STABLE_MIN_S", "0.3"))
 FIST_WS = int(os.environ.get("GEST_FIST_WS", "10"))
@@ -286,9 +287,10 @@ def main() -> int:
                 else:
                     stable_count = count; stable_since = now; stable_frames_have = 1
 
-            # mano arma preview en lugar de disparar directo
+            # mano arma preview en lugar de disparar directo (gated)
             can_preview = (
-                stable_count is not None
+                COUNT_WS_ENABLE
+                and stable_count is not None
                 and target_ws is not None
                 and stable_frames_have >= STABLE_FRAMES
                 and (now - stable_since) >= STABLE_MIN_S
